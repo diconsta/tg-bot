@@ -8,8 +8,6 @@ export class AddMediaGroupCache1710000000007 implements MigrationInterface {
         "messageId" integer NOT NULL,
         "chatId" character varying NOT NULL,
         "threadId" character varying NOT NULL,
-        "pendingPhotos" jsonb NOT NULL DEFAULT '[]',
-        "finalized" boolean NOT NULL DEFAULT false,
         "createdAt" TIMESTAMP NOT NULL DEFAULT now(),
         CONSTRAINT "PK_media_group_cache" PRIMARY KEY ("mediaGroupId")
       )
