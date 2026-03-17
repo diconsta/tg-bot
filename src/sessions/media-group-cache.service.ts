@@ -48,33 +48,31 @@ export class MediaGroupCacheService {
     mediaGroupId: string,
     photo: PendingPhoto,
   ): Promise<void> {
-    await this.repo
-      .createQueryBuilder()
-      .update(MediaGroupCacheEntity)
-      .set({ pendingPhotos: () => `"pendingPhotos" || :photo::jsonb` })
-      .setParameter('photo', JSON.stringify([photo]))
-      .where('"mediaGroupId" = :mediaGroupId', { mediaGroupId })
-      .execute();
+    await this.repo.query(
+      `UPDATE "media_group_cache" SET "pendingPhotos" = "pendingPhotos" || $1::jsonb WHERE "mediaGroupId" = $2`,
+      [JSON.stringify([photo]), mediaGroupId],
+    );
   }
 
   async getPendingPhotos(mediaGroupId: string): Promise<PendingPhoto[]> {
-    const entity = await this.repo.findOne({ where: { mediaGroupId } });
-    return entity?.pendingPhotos ?? [];
+    const rows: { pendingPhotos: PendingPhoto[] }[] = await this.repo.query(
+      `SELECT "pendingPhotos" FROM "media_group_cache" WHERE "mediaGroupId" = $1`,
+      [mediaGroupId],
+    );
+    return rows[0]?.pendingPhotos ?? [];
   }
 
   /**
-   * Atomically claims finalization. Returns true only for the one invocation
-   * that successfully flips finalized from false → true.
+   * Atomically marks the album as finalized.
+   * Returns true only for the one invocation that successfully flips finalized false → true.
+   * Raw query used because pg's rowCount is reliable at the driver level.
    */
   async tryFinalize(mediaGroupId: string): Promise<boolean> {
-    const result = await this.repo
-      .createQueryBuilder()
-      .update(MediaGroupCacheEntity)
-      .set({ finalized: true })
-      .where('"mediaGroupId" = :mediaGroupId AND "finalized" = false', {
-        mediaGroupId,
-      })
-      .execute();
-    return (result.affected ?? 0) > 0;
+    // pg driver returns [rows, rowCount]
+    const [, rowCount] = (await this.repo.query(
+      `UPDATE "media_group_cache" SET "finalized" = true WHERE "mediaGroupId" = $1 AND "finalized" = false`,
+      [mediaGroupId],
+    )) as [unknown[], number];
+    return rowCount > 0;
   }
 }
