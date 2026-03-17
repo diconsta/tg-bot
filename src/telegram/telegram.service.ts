@@ -79,6 +79,20 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
+  async editMessageText(
+    chatId: string,
+    messageId: number,
+    text: string,
+    replyMarkup?: TelegramBot.InlineKeyboardMarkup,
+  ): Promise<void> {
+    await this.bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'HTML',
+      reply_markup: replyMarkup,
+    });
+  }
+
   async editMessageReplyMarkup(
     chatId: string,
     messageId: number,

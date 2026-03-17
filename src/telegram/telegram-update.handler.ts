@@ -156,12 +156,6 @@ export class TelegramUpdateHandler implements OnModuleInit {
     session: UserSessionEntity,
     user: TelegramBot.User,
   ) {
-    const processingMsg = await this.telegramService.sendProcessingMessage(
-      session.chatId,
-      session.threadId,
-      '⏳ Przetwarzanie zdjęć...',
-    );
-
     try {
       const object = await this.objectsService.findById(session.objectId);
       const currentCount = await this.photosService.countPhotosForStage(
@@ -172,10 +166,6 @@ export class TelegramUpdateHandler implements OnModuleInit {
       const maxPhotos = this.photosService.getMaxPhotosAllowed();
 
       if (currentCount + photosData.length > maxPhotos) {
-        await this.telegramService.deleteMessage(
-          session.chatId,
-          processingMsg.message_id,
-        );
         await this.telegramService.sendMessageToThread(
           session.chatId,
           session.threadId,
@@ -184,7 +174,6 @@ export class TelegramUpdateHandler implements OnModuleInit {
         return;
       }
 
-      // Download photos from Telegram and upload to Google Drive (if enabled)
       const enrichedPhotosData = await this.uploadPhotosToDrive(
         photosData,
         object.name,
@@ -207,50 +196,42 @@ export class TelegramUpdateHandler implements OnModuleInit {
       const newCount = currentCount + photosData.length;
       const minRequired = this.photosService.getMinPhotosRequired();
 
-      await this.telegramService.deleteMessage(
-        session.chatId,
-        processingMsg.message_id,
-      );
+      const statusText =
+        `📷 <b>Etap ${session.stageIndex}: ${session.stageName}</b>\n\n` +
+        `Łącznie zdjęć: <b>${newCount}/${maxPhotos}</b>\n` +
+        (newCount >= minRequired
+          ? `✅ Minimalna liczba zdjęć osiągnięta.\n`
+          : `⚠️ Potrzeba jeszcze <b>${minRequired - newCount}</b> zdjęcie(a).\n`) +
+        `\nKliknij „Zakończ", gdy skończysz dodawać zdjęcia.`;
 
-      // Delete old "Finish adding photos" button message if it exists
-      if (session.finishButtonMessageId) {
-        await this.telegramService.deleteMessage(
-          session.chatId,
-          session.finishButtonMessageId,
-        );
-      }
-
-      await this.telegramService.sendMessageToThread(
-        session.chatId,
-        session.threadId,
-        `✅ Dodano ${photosData.length} zdjęcie(a). Łącznie: ${newCount}/${maxPhotos}\n${newCount >= minRequired ? '✓ Minimalna liczba zdjęć osiągnięta. Możesz zakończyć etap.' : `⚠ Potrzeba jeszcze co najmniej ${minRequired - newCount} zdjęcie(a) do zakończenia etapu.`}\n\n💡 Możesz dalej dodawać zdjęcia lub skorzystać z przycisków poniżej.`,
-      );
-
-      // Re-send the "Finish adding photos" button below the status message
       const finishKeyboard = this.telegramService.createInlineKeyboard([
-        [
-          {
-            text: '✅ Zakończ dodawanie zdjęć',
-            callback_data: 'action:done_photos',
-          },
-        ],
+        [{ text: '✅ Zakończ dodawanie zdjęć', callback_data: 'action:done_photos' }],
       ]);
-      const finishMsg = await this.telegramService.sendMessageToThread(
-        session.chatId,
-        session.threadId,
-        `Kliknij „Zakończ", gdy skończysz dodawać zdjęcia.`,
-        finishKeyboard,
-      );
-      await this.sessionsService.update(session.id, { finishButtonMessageId: finishMsg.message_id });
 
-      // Don't clear session - allow user to continue adding photos
-      // Session will be cleared when user completes stage or cancels
+      if (session.finishButtonMessageId) {
+        // Edit the existing message in place — no new message spam for album uploads
+        try {
+          await this.telegramService.editMessageText(
+            session.chatId,
+            session.finishButtonMessageId,
+            statusText,
+            finishKeyboard,
+          );
+        } catch {
+          // Message may have been deleted — send a fresh one
+          const msg = await this.telegramService.sendMessageToThread(
+            session.chatId, session.threadId, statusText, finishKeyboard,
+          );
+          await this.sessionsService.update(session.id, { finishButtonMessageId: msg.message_id });
+        }
+      } else {
+        const msg = await this.telegramService.sendMessageToThread(
+          session.chatId, session.threadId, statusText, finishKeyboard,
+        );
+        await this.sessionsService.update(session.id, { finishButtonMessageId: msg.message_id });
+      }
     } catch (error) {
       this.logger.error(`Error processing photos: ${error.message}`);
-      await this.telegramService.deleteMessage(
-        session.chatId,
-        processingMsg.message_id,
-      );
       await this.telegramService.sendMessageToThread(
         session.chatId,
         session.threadId,
