@@ -9,6 +9,7 @@ import { HistoryService } from '../history/history.service';
 import { CoordinatorsService } from '../coordinators/coordinators.service';
 import { GoogleDriveStorageService } from '../storage/google-drive-storage.service';
 import { SessionsService } from '../sessions/sessions.service';
+import { MediaGroupCacheService } from '../sessions/media-group-cache.service';
 import { UserSessionEntity } from '../sessions/entities/user-session.entity';
 
 @Injectable()
@@ -26,6 +27,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     private coordinatorsService: CoordinatorsService,
     private googleDriveStorage: GoogleDriveStorageService,
     private sessionsService: SessionsService,
+    private mediaGroupCacheService: MediaGroupCacheService,
   ) {}
 
   onModuleInit() {
@@ -131,15 +133,10 @@ export class TelegramUpdateHandler implements OnModuleInit {
     const threadId = msg.message_thread_id?.toString();
     const userId = msg.from?.id.toString();
 
-    if (!threadId) {
-      return;
-    }
+    if (!threadId) return;
 
     const session = await this.sessionsService.get(userId, chatId, threadId);
-
-    if (!session || session.state !== 'AWAITING_PHOTOS') {
-      return;
-    }
+    if (!session || session.state !== 'AWAITING_PHOTOS') return;
 
     const photo = msg.photo[msg.photo.length - 1];
     const photoData: TelegramPhotoData = {
@@ -148,20 +145,68 @@ export class TelegramUpdateHandler implements OnModuleInit {
       fileSize: photo.file_size,
     };
 
-    await this.processBatchPhotos([photoData], session, msg.from);
+    if (msg.media_group_id) {
+      await this.processAlbumPhoto(msg.media_group_id, photoData, session, msg.from);
+    } else {
+      await this.processBatchPhotos([photoData], session, msg.from, null);
+    }
+  }
+
+  private async processAlbumPhoto(
+    mediaGroupId: string,
+    photoData: TelegramPhotoData,
+    session: UserSessionEntity,
+    user: TelegramBot.User,
+  ) {
+    // Send the shared "Processing..." message only once for the whole album.
+    // First invocation creates it; subsequent ones reuse the same message ID.
+    const processingMsg = await this.telegramService.sendMessageToThread(
+      session.chatId,
+      session.threadId,
+      '⏳ Przetwarzanie zdjęć...',
+    );
+
+    const { messageId, isNew } = await this.mediaGroupCacheService.getOrCreate(
+      mediaGroupId,
+      processingMsg.message_id,
+      session.chatId,
+      session.threadId,
+    );
+
+    if (!isNew && messageId !== processingMsg.message_id) {
+      // Another invocation already created the shared message — delete our duplicate
+      await this.telegramService.deleteMessage(session.chatId, processingMsg.message_id);
+    } else if (isNew && session.finishButtonMessageId) {
+      // We are first — delete the initial "add photos" instructions message
+      await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
+    }
+
+    await this.processBatchPhotos([photoData], session, user, messageId);
   }
 
   private async processBatchPhotos(
     photosData: TelegramPhotoData[],
     session: UserSessionEntity,
     user: TelegramBot.User,
+    sharedMessageId: number | null,
   ) {
-    // Send "Processing..." and immediately edit it into the result when done
-    const processingMsg = await this.telegramService.sendMessageToThread(
-      session.chatId,
-      session.threadId,
-      '⏳ Przetwarzanie zdjęć...',
-    );
+    // For single photos: send a fresh "Processing..." message.
+    // For album photos: reuse the shared message id passed in from processAlbumPhoto.
+    let processingMessageId: number;
+
+    if (sharedMessageId !== null) {
+      processingMessageId = sharedMessageId;
+    } else {
+      if (session.finishButtonMessageId) {
+        await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
+      }
+      const processingMsg = await this.telegramService.sendMessageToThread(
+        session.chatId,
+        session.threadId,
+        '⏳ Przetwarzanie zdjęć...',
+      );
+      processingMessageId = processingMsg.message_id;
+    }
 
     try {
       const object = await this.objectsService.findById(session.objectId);
@@ -175,7 +220,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
       if (currentCount + photosData.length > maxPhotos) {
         await this.telegramService.editMessageText(
           session.chatId,
-          processingMsg.message_id,
+          processingMessageId,
           `❌ Nie można dodać ${photosData.length} zdjęć. Maksymalna liczba: ${maxPhotos}. Aktualnie: ${currentCount}.`,
         );
         return;
@@ -212,24 +257,27 @@ export class TelegramUpdateHandler implements OnModuleInit {
           : `⚠️ Potrzeba jeszcze <b>${minRequired - newCount}</b> zdjęcie(a).`);
 
       const finishKeyboard = this.telegramService.createInlineKeyboard([
-        [{ text: '✅ Zakończ dodawanie zdjęć', callback_data: 'action:done_photos' }],
+        [
+          {
+            text: '✅ Zakończ dodawanie zdjęć',
+            callback_data: 'action:done_photos',
+          },
+        ],
       ]);
 
-      // Edit "Processing..." into the result message with finish button
       await this.telegramService.editMessageText(
         session.chatId,
-        processingMsg.message_id,
+        processingMessageId,
         resultText,
         finishKeyboard,
       );
 
-      // Track this as the latest finish button message
-      await this.sessionsService.update(session.id, { finishButtonMessageId: processingMsg.message_id });
+      await this.sessionsService.update(session.id, { finishButtonMessageId: processingMessageId });
     } catch (error) {
       this.logger.error(`Error processing photos: ${error.message}`);
       await this.telegramService.editMessageText(
         session.chatId,
-        processingMsg.message_id,
+        processingMessageId,
         `❌ Błąd podczas dodawania zdjęć: ${error.message}`,
       );
     }
@@ -363,20 +411,10 @@ export class TelegramUpdateHandler implements OnModuleInit {
 
     const minPhotos = this.photosService.getMinPhotosRequired();
 
-    const keyboard = this.telegramService.createInlineKeyboard([
-      [
-        {
-          text: '✅ Zakończ dodawanie zdjęć',
-          callback_data: 'action:done_photos',
-        },
-      ],
-    ]);
-
     const sentMsg = await this.telegramService.sendMessageToThread(
       chatId,
       threadId,
-      `📷 Prześlij zdjęcia do etapu ${object.currentStage.stageIndex}: ${object.currentStage.stageName}.\n\nAktualnie: ${currentCount}/${maxPhotos}\nMinimum wymagane: ${minPhotos}\n\nMożesz wysyłać zdjęcia jako album lub pojedynczo. Kliknij „Zakończ", gdy skończysz.`,
-      keyboard,
+      `📷 Prześlij zdjęcia do etapu ${object.currentStage.stageIndex}: ${object.currentStage.stageName}.\n\nAktualnie: ${currentCount}/${maxPhotos}\nMinimum wymagane: ${minPhotos}\n\nMożesz wysyłać zdjęcia jako album lub pojedynczo.`,
     );
 
     await this.sessionsService.create({
@@ -582,7 +620,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     const allStages = await this.stagesService.getAllMasterStages();
 
     // Create keyboard with stage buttons
-    const keyboard = [];
+    const keyboard: TelegramBot.InlineKeyboardButton[][] = [];
     for (const stage of allStages) {
       const photoCount = await this.photosService.countPhotosForStage(
         object.id,
@@ -600,12 +638,16 @@ export class TelegramUpdateHandler implements OnModuleInit {
     // Delete processing message
     await this.telegramService.deleteMessage(chatId, processingMsg.message_id);
 
-    await this.bot.sendMessage(chatId, `📸 Wybierz etap, aby zobaczyć zdjęcia:`, {
-      message_thread_id: parseInt(threadId, 10),
-      reply_markup: {
-        inline_keyboard: keyboard,
-      },
-    });
+    await this.bot.sendMessage(
+      chatId,
+      `📸 Wybierz etap, aby zobaczyć zdjęcia:`,
+      {
+        message_thread_id: parseInt(threadId, 10),
+        reply_markup: {
+          inline_keyboard: keyboard,
+        },
+      } as TelegramBot.SendMessageOptions,
+    );
   }
 
   private async handleViewStagePhotos(
