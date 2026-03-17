@@ -191,7 +191,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     const myCount = await this.mediaGroupCacheService.incrementProcessed(mediaGroupId);
 
     // Wait for other concurrent invocations to finish processing
-    await new Promise<void>(resolve => setTimeout(resolve, 2500));
+    await new Promise<void>(resolve => setTimeout(resolve, 5000));
 
     // Check if we are still the last — if another invocation incremented after us, let it handle the result
     const currentCount = await this.mediaGroupCacheService.getProcessedCount(mediaGroupId);
