@@ -1,0 +1,6 @@
+export enum HistoryAction {
+  PHOTO_ADDED = 'PHOTO_ADDED',
+  STAGE_COMPLETED = 'STAGE_COMPLETED',
+  PAUSED = 'PAUSED',
+  RESUMED = 'RESUMED',
+}

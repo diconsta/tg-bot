@@ -1,0 +1,499 @@
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import TelegramBot from 'node-telegram-bot-api';
+import { TelegramService } from './telegram.service';
+import { TelegramAdminCommandsHandler } from './telegram-admin-commands.handler';
+import { ObjectsService } from '../objects/objects.service';
+import { StagesService } from '../stages/stages.service';
+import { PhotosService } from '../photos/photos.service';
+import { HistoryService } from '../history/history.service';
+import { GoogleDriveService } from '../google-drive/google-drive.service';
+import { CoordinatorsService } from '../coordinators/coordinators.service';
+import {
+  UserSession,
+  UserSessionState,
+} from './interfaces/user-session.interface';
+
+@Injectable()
+export class TelegramUpdateHandler implements OnModuleInit {
+  private readonly logger = new Logger(TelegramUpdateHandler.name);
+  private bot: TelegramBot;
+  private stageNames: string[];
+  private stageDescriptions: string[];
+  private userSessions: Map<string, UserSession> = new Map();
+  private mediaGroups: Map<string, Buffer[]> = new Map();
+
+  constructor(
+    private telegramService: TelegramService,
+    private adminCommandsHandler: TelegramAdminCommandsHandler,
+    private objectsService: ObjectsService,
+    private stagesService: StagesService,
+    private photosService: PhotosService,
+    private historyService: HistoryService,
+    private googleDriveService: GoogleDriveService,
+    private coordinatorsService: CoordinatorsService,
+    private configService: ConfigService,
+  ) {
+    this.stageNames = this.configService.get<string[]>('app.stages.names');
+    this.stageDescriptions = this.configService.get<string[]>('app.stages.descriptions');
+  }
+
+  onModuleInit() {
+    this.bot = this.telegramService.getBot();
+    this.setupHandlers();
+    this.logger.log('Telegram update handlers registered');
+  }
+
+  private setupHandlers() {
+    this.bot.on('message', (msg) => this.handleMessage(msg));
+    this.bot.on('callback_query', (query) => this.handleCallbackQuery(query));
+  }
+
+  private async handleMessage(msg: TelegramBot.Message) {
+    try {
+      // Handle admin commands
+      if (msg.text && msg.text.startsWith('/')) {
+        await this.adminCommandsHandler.handleCommand(msg);
+        // Auto-create or update coordinator info when they interact
+        if (msg.from) {
+          await this.coordinatorsService.getOrCreateCoordinator(
+            msg.from.id.toString(),
+            msg.from.username,
+            msg.from.first_name,
+            msg.from.last_name,
+          );
+        }
+        return;
+      }
+
+      if (msg.forum_topic_created) {
+        await this.handleForumTopicCreated(msg);
+      } else if (msg.photo) {
+        await this.handlePhotoMessage(msg);
+      }
+    } catch (error) {
+      this.logger.error(`Error handling message: ${error.message}`, error.stack);
+    }
+  }
+
+  private async handleForumTopicCreated(msg: TelegramBot.Message) {
+    const chatId = msg.chat.id.toString();
+    const threadId = msg.message_thread_id?.toString();
+    const topicName = msg.forum_topic_created.name;
+
+    if (!threadId) {
+      this.logger.warn('Forum topic created without thread ID');
+      return;
+    }
+
+    this.logger.log(`New forum topic created: "${topicName}" (Thread: ${threadId})`);
+
+    const existingObject = await this.objectsService.findByTelegramIds(
+      chatId,
+      threadId,
+    );
+
+    if (existingObject) {
+      this.logger.warn(
+        `Object already exists for chat ${chatId}, thread ${threadId}`,
+      );
+      return;
+    }
+
+    const object = await this.objectsService.create({
+      telegramChatId: chatId,
+      telegramThreadId: threadId,
+      name: topicName,
+    });
+
+    await this.stagesService.createStagesForObject(
+      object.id,
+      this.stageNames,
+      this.stageDescriptions,
+    );
+
+    await this.googleDriveService.createObjectFolderStructure(
+      topicName,
+      this.stageNames,
+    );
+
+    const welcomeMessage = this.formatWelcomeMessage(topicName);
+    const keyboard = this.telegramService.createStageActionButtons();
+
+    await this.telegramService.sendMessageToThread(
+      chatId,
+      threadId,
+      welcomeMessage,
+      keyboard,
+    );
+
+    this.logger.log(`Object created: ${object.name} (ID: ${object.id})`);
+  }
+
+  private async handlePhotoMessage(msg: TelegramBot.Message) {
+    const chatId = msg.chat.id.toString();
+    const threadId = msg.message_thread_id?.toString();
+    const userId = msg.from?.id.toString();
+
+    if (!threadId) {
+      return;
+    }
+
+    const sessionKey = this.getSessionKey(userId, chatId, threadId);
+    const session = this.userSessions.get(sessionKey);
+
+    if (!session || session.state !== UserSessionState.AWAITING_PHOTOS) {
+      return;
+    }
+
+    const photo = msg.photo[msg.photo.length - 1];
+    const photoBuffer = await this.telegramService.downloadPhoto(photo.file_id);
+
+    if (msg.media_group_id) {
+      await this.handleMediaGroupPhoto(
+        msg.media_group_id,
+        photoBuffer,
+        session,
+        msg.from,
+      );
+    } else {
+      await this.handleSinglePhoto(photoBuffer, session, msg.from);
+    }
+  }
+
+  private async handleMediaGroupPhoto(
+    mediaGroupId: string,
+    photoBuffer: Buffer,
+    session: UserSession,
+    user: TelegramBot.User,
+  ) {
+    if (!this.mediaGroups.has(mediaGroupId)) {
+      this.mediaGroups.set(mediaGroupId, []);
+    }
+
+    this.mediaGroups.get(mediaGroupId).push(photoBuffer);
+
+    if (session.mediaGroupTimeout) {
+      clearTimeout(session.mediaGroupTimeout);
+    }
+
+    session.mediaGroupTimeout = setTimeout(async () => {
+      const photos = this.mediaGroups.get(mediaGroupId);
+      this.mediaGroups.delete(mediaGroupId);
+
+      await this.processBatchPhotos(photos, session, user);
+    }, 1000);
+  }
+
+  private async handleSinglePhoto(
+    photoBuffer: Buffer,
+    session: UserSession,
+    user: TelegramBot.User,
+  ) {
+    await this.processBatchPhotos([photoBuffer], session, user);
+  }
+
+  private async processBatchPhotos(
+    photoBuffers: Buffer[],
+    session: UserSession,
+    user: TelegramBot.User,
+  ) {
+    try {
+      const object = await this.objectsService.findById(session.objectId);
+      const currentCount = await this.photosService.countPhotosForStage(
+        object.id,
+        session.stageNumber,
+      );
+
+      const maxPhotos = this.photosService.getMaxPhotosAllowed();
+
+      if (currentCount + photoBuffers.length > maxPhotos) {
+        await this.telegramService.sendMessageToThread(
+          session.chatId,
+          session.threadId,
+          `❌ Cannot add ${photoBuffers.length} photos. Maximum ${maxPhotos} photos per stage. You currently have ${currentCount} photos.`,
+        );
+        return;
+      }
+
+      await this.photosService.addMultiplePhotos(
+        object.id,
+        object.name,
+        session.stageNumber,
+        photoBuffers,
+      );
+
+      await this.historyService.recordPhotoAdded(
+        object.id,
+        session.stageNumber,
+        user.id.toString(),
+        user.username,
+      );
+
+      const newCount = currentCount + photoBuffers.length;
+      const minRequired = this.photosService.getMinPhotosRequired();
+
+      await this.telegramService.sendMessageToThread(
+        session.chatId,
+        session.threadId,
+        `✅ Added ${photoBuffers.length} photo(s). Total: ${newCount}/${maxPhotos}\n${newCount >= minRequired ? '✓ Minimum photos requirement met. You can complete the stage.' : `⚠ Need at least ${minRequired - newCount} more photo(s) to complete stage.`}`,
+      );
+
+      this.clearUserSession(session);
+    } catch (error) {
+      this.logger.error(`Error processing photos: ${error.message}`);
+      await this.telegramService.sendMessageToThread(
+        session.chatId,
+        session.threadId,
+        `❌ Error adding photos: ${error.message}`,
+      );
+    }
+  }
+
+  private async handleCallbackQuery(query: TelegramBot.CallbackQuery) {
+    try {
+      const data = query.data;
+      const chatId = query.message.chat.id.toString();
+      const threadId = query.message.message_thread_id?.toString();
+      const userId = query.from.id.toString();
+
+      if (!threadId) {
+        await this.telegramService.answerCallbackQuery(
+          query.id,
+          'This action must be performed in a topic',
+        );
+        return;
+      }
+
+      const object = await this.objectsService.findByTelegramIds(
+        chatId,
+        threadId,
+      );
+
+      if (!object) {
+        await this.telegramService.answerCallbackQuery(
+          query.id,
+          'Object not found',
+        );
+        return;
+      }
+
+      // Check if user has permission to manage this object
+      const canManage = await this.coordinatorsService.canManageObject(
+        userId,
+        object.id,
+      );
+
+      if (!canManage) {
+        await this.telegramService.answerCallbackQuery(
+          query.id,
+          '❌ You are not authorized to manage this object',
+        );
+        return;
+      }
+
+      if (data === 'action:add_photos') {
+        await this.handleAddPhotosAction(query, object, userId);
+      } else if (data === 'action:complete_stage') {
+        await this.handleCompleteStageAction(query, object, userId);
+      } else if (data === 'action:pause') {
+        await this.handlePauseAction(query, object, userId);
+      } else if (data === 'action:resume') {
+        await this.handleResumeAction(query, object, userId);
+      }
+
+      await this.telegramService.answerCallbackQuery(query.id);
+    } catch (error) {
+      this.logger.error(`Error handling callback query: ${error.message}`, error.stack);
+      await this.telegramService.answerCallbackQuery(
+        query.id,
+        'An error occurred',
+      );
+    }
+  }
+
+  private async handleAddPhotosAction(
+    query: TelegramBot.CallbackQuery,
+    object: any,
+    userId: string,
+  ) {
+    const chatId = query.message.chat.id.toString();
+    const threadId = object.telegramThreadId;
+
+    const currentCount = await this.photosService.countPhotosForStage(
+      object.id,
+      object.currentStage,
+    );
+
+    const maxPhotos = this.photosService.getMaxPhotosAllowed();
+
+    if (currentCount >= maxPhotos) {
+      await this.telegramService.sendMessageToThread(
+        chatId,
+        threadId,
+        `❌ Maximum of ${maxPhotos} photos already reached for this stage.`,
+      );
+      return;
+    }
+
+    const sessionKey = this.getSessionKey(userId, chatId, threadId);
+    this.userSessions.set(sessionKey, {
+      userId,
+      chatId,
+      threadId,
+      state: UserSessionState.AWAITING_PHOTOS,
+      objectId: object.id,
+      stageNumber: object.currentStage,
+      photoBuffer: [],
+    });
+
+    const minPhotos = this.photosService.getMinPhotosRequired();
+
+    await this.telegramService.sendMessageToThread(
+      chatId,
+      threadId,
+      `📷 Please send photos for stage ${object.currentStage}.\n\nCurrent: ${currentCount}/${maxPhotos}\nMinimum required: ${minPhotos}\n\nYou can send multiple photos as an album or one by one.`,
+    );
+  }
+
+  private async handleCompleteStageAction(
+    query: TelegramBot.CallbackQuery,
+    object: any,
+    userId: string,
+  ) {
+    const chatId = query.message.chat.id.toString();
+    const threadId = object.telegramThreadId;
+
+    const hasMinPhotos = await this.photosService.validateMinimumPhotos(
+      object.id,
+      object.currentStage,
+    );
+
+    if (!hasMinPhotos) {
+      const minPhotos = this.photosService.getMinPhotosRequired();
+      const currentCount = await this.photosService.countPhotosForStage(
+        object.id,
+        object.currentStage,
+      );
+
+      await this.telegramService.sendMessageToThread(
+        chatId,
+        threadId,
+        `❌ Cannot complete stage. You need at least ${minPhotos} photos. Current: ${currentCount}`,
+      );
+      return;
+    }
+
+    await this.stagesService.completeStage(object.id, object.currentStage);
+
+    await this.historyService.recordStageCompleted(
+      object.id,
+      object.currentStage,
+      userId,
+      query.from.username,
+    );
+
+    const updatedObject = await this.objectsService.progressToNextStage(
+      object.id,
+      this.stageNames.length,
+    );
+
+    if (updatedObject.status === 'DONE') {
+      await this.telegramService.sendMessageToThread(
+        chatId,
+        threadId,
+        `🎉 <b>Congratulations!</b>\n\nAll stages completed for: <b>${object.name}</b>\n\nThe object is now marked as DONE.`,
+      );
+    } else {
+      const stageName = await this.stagesService.getCurrentStageName(
+        object.id,
+        updatedObject.currentStage,
+      );
+
+      const keyboard = this.telegramService.createStageActionButtons();
+
+      await this.telegramService.sendMessageToThread(
+        chatId,
+        threadId,
+        `✅ Stage ${object.currentStage} completed!\n\n🔄 Moving to Stage ${updatedObject.currentStage}: <b>${stageName}</b>`,
+        keyboard,
+      );
+    }
+  }
+
+  private async handlePauseAction(
+    query: TelegramBot.CallbackQuery,
+    object: any,
+    userId: string,
+  ) {
+    const chatId = query.message.chat.id.toString();
+    const threadId = object.telegramThreadId;
+
+    await this.objectsService.togglePause(object.id);
+
+    await this.historyService.recordPaused(
+      object.id,
+      object.currentStage,
+      userId,
+      query.from.username,
+    );
+
+    const keyboard = this.telegramService.createPausedActionButtons();
+
+    await this.telegramService.sendMessageToThread(
+      chatId,
+      threadId,
+      `⏸ Object paused. Daily reminders will not be sent until resumed.`,
+      keyboard,
+    );
+  }
+
+  private async handleResumeAction(
+    query: TelegramBot.CallbackQuery,
+    object: any,
+    userId: string,
+  ) {
+    const chatId = query.message.chat.id.toString();
+    const threadId = object.telegramThreadId;
+
+    await this.objectsService.togglePause(object.id);
+
+    await this.historyService.recordResumed(
+      object.id,
+      object.currentStage,
+      userId,
+      query.from.username,
+    );
+
+    const keyboard = this.telegramService.createStageActionButtons();
+
+    await this.telegramService.sendMessageToThread(
+      chatId,
+      threadId,
+      `▶️ Object resumed. Daily reminders will continue.`,
+      keyboard,
+    );
+  }
+
+  private formatWelcomeMessage(objectName: string): string {
+    return `🏗 <b>New Object Created</b>\n\nObject: <b>${objectName}</b>\nStage: <b>1 — ${this.stageNames[0]}</b>\n\nUse the buttons below to manage this object.`;
+  }
+
+  private getSessionKey(userId: string, chatId: string, threadId: string): string {
+    return `${userId}_${chatId}_${threadId}`;
+  }
+
+  private clearUserSession(session: UserSession) {
+    const sessionKey = this.getSessionKey(
+      session.userId,
+      session.chatId,
+      session.threadId,
+    );
+
+    if (session.mediaGroupTimeout) {
+      clearTimeout(session.mediaGroupTimeout);
+    }
+
+    this.userSessions.delete(sessionKey);
+  }
+}
