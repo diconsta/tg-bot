@@ -156,6 +156,13 @@ export class TelegramUpdateHandler implements OnModuleInit {
     session: UserSessionEntity,
     user: TelegramBot.User,
   ) {
+    // Send "Processing..." and immediately edit it into the result when done
+    const processingMsg = await this.telegramService.sendMessageToThread(
+      session.chatId,
+      session.threadId,
+      '⏳ Przetwarzanie zdjęć...',
+    );
+
     try {
       const object = await this.objectsService.findById(session.objectId);
       const currentCount = await this.photosService.countPhotosForStage(
@@ -166,10 +173,10 @@ export class TelegramUpdateHandler implements OnModuleInit {
       const maxPhotos = this.photosService.getMaxPhotosAllowed();
 
       if (currentCount + photosData.length > maxPhotos) {
-        await this.telegramService.sendMessageToThread(
+        await this.telegramService.editMessageText(
           session.chatId,
-          session.threadId,
-          `❌ Nie można dodać ${photosData.length} zdjęć. Maksymalna liczba zdjęć na etap wynosi ${maxPhotos}. Masz aktualnie ${currentCount} zdjęć.`,
+          processingMsg.message_id,
+          `❌ Nie można dodać ${photosData.length} zdjęć. Maksymalna liczba: ${maxPhotos}. Aktualnie: ${currentCount}.`,
         );
         return;
       }
@@ -196,45 +203,33 @@ export class TelegramUpdateHandler implements OnModuleInit {
       const newCount = currentCount + photosData.length;
       const minRequired = this.photosService.getMinPhotosRequired();
 
-      const statusText =
-        `📷 <b>Etap ${session.stageIndex}: ${session.stageName}</b>\n\n` +
-        `Łącznie zdjęć: <b>${newCount}/${maxPhotos}</b>\n` +
+      const resultText =
+        `✅ Dodano ${photosData.length} zdjęcie(a).\n\n` +
+        `📷 <b>Etap ${session.stageIndex}: ${session.stageName}</b>\n` +
+        `Łącznie: <b>${newCount}/${maxPhotos}</b>\n` +
         (newCount >= minRequired
-          ? `✅ Minimalna liczba zdjęć osiągnięta.\n`
-          : `⚠️ Potrzeba jeszcze <b>${minRequired - newCount}</b> zdjęcie(a).\n`) +
-        `\nKliknij „Zakończ", gdy skończysz dodawać zdjęcia.`;
+          ? `✅ Minimalna liczba zdjęć osiągnięta.`
+          : `⚠️ Potrzeba jeszcze <b>${minRequired - newCount}</b> zdjęcie(a).`);
 
       const finishKeyboard = this.telegramService.createInlineKeyboard([
         [{ text: '✅ Zakończ dodawanie zdjęć', callback_data: 'action:done_photos' }],
       ]);
 
-      if (session.finishButtonMessageId) {
-        // Edit the existing message in place — no new message spam for album uploads
-        try {
-          await this.telegramService.editMessageText(
-            session.chatId,
-            session.finishButtonMessageId,
-            statusText,
-            finishKeyboard,
-          );
-        } catch {
-          // Message may have been deleted — send a fresh one
-          const msg = await this.telegramService.sendMessageToThread(
-            session.chatId, session.threadId, statusText, finishKeyboard,
-          );
-          await this.sessionsService.update(session.id, { finishButtonMessageId: msg.message_id });
-        }
-      } else {
-        const msg = await this.telegramService.sendMessageToThread(
-          session.chatId, session.threadId, statusText, finishKeyboard,
-        );
-        await this.sessionsService.update(session.id, { finishButtonMessageId: msg.message_id });
-      }
+      // Edit "Processing..." into the result message with finish button
+      await this.telegramService.editMessageText(
+        session.chatId,
+        processingMsg.message_id,
+        resultText,
+        finishKeyboard,
+      );
+
+      // Track this as the latest finish button message
+      await this.sessionsService.update(session.id, { finishButtonMessageId: processingMsg.message_id });
     } catch (error) {
       this.logger.error(`Error processing photos: ${error.message}`);
-      await this.telegramService.sendMessageToThread(
+      await this.telegramService.editMessageText(
         session.chatId,
-        session.threadId,
+        processingMsg.message_id,
         `❌ Błąd podczas dodawania zdjęć: ${error.message}`,
       );
     }
