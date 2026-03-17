@@ -14,6 +14,9 @@ export class MediaGroupCacheEntity {
   @Column()
   threadId: string;
 
+  @Column({ default: 0 })
+  processedCount: number;
+
   @CreateDateColumn()
   createdAt: Date;
 }

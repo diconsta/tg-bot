@@ -41,4 +41,24 @@ export class MediaGroupCacheService {
     const existing = await this.repo.findOne({ where: { mediaGroupId } });
     return { messageId: existing.messageId, isNew: false };
   }
+
+  /**
+   * Atomically increments processedCount and returns the new value.
+   * Used to determine which invocation is the last one for an album.
+   */
+  async incrementProcessed(mediaGroupId: string): Promise<number> {
+    const result = await this.repo
+      .createQueryBuilder()
+      .update(MediaGroupCacheEntity)
+      .set({ processedCount: () => '"processedCount" + 1' })
+      .where('"mediaGroupId" = :mediaGroupId', { mediaGroupId })
+      .returning('"processedCount"')
+      .execute();
+    return result.raw[0].processedCount as number;
+  }
+
+  async getProcessedCount(mediaGroupId: string): Promise<number> {
+    const entity = await this.repo.findOne({ where: { mediaGroupId } });
+    return entity?.processedCount ?? 0;
+  }
 }

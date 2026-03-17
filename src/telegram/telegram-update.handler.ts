@@ -148,7 +148,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     if (msg.media_group_id) {
       await this.processAlbumPhoto(msg.media_group_id, photoData, session, msg.from);
     } else {
-      await this.processBatchPhotos([photoData], session, msg.from, null);
+      await this.processBatchPhotos([photoData], session, msg.from);
     }
   }
 
@@ -158,8 +158,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     session: UserSessionEntity,
     user: TelegramBot.User,
   ) {
-    // Send the shared "Processing..." message only once for the whole album.
-    // First invocation creates it; subsequent ones reuse the same message ID.
+    // Each invocation sends its own Processing message; first one wins via DB upsert.
     const processingMsg = await this.telegramService.sendMessageToThread(
       session.chatId,
       session.threadId,
@@ -181,75 +180,90 @@ export class TelegramUpdateHandler implements OnModuleInit {
       await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
     }
 
-    await this.processBatchPhotos([photoData], session, user, messageId);
+    // Upload and save this photo
+    try {
+      await this.uploadAndSavePhoto(photoData, session, user);
+    } catch (error) {
+      this.logger.error(`Error uploading album photo: ${error.message}`);
+    }
+
+    // Atomically increment processedCount, get our sequence number
+    const myCount = await this.mediaGroupCacheService.incrementProcessed(mediaGroupId);
+
+    // Wait for other concurrent invocations to finish processing
+    await new Promise<void>(resolve => setTimeout(resolve, 2500));
+
+    // Check if we are still the last — if another invocation incremented after us, let it handle the result
+    const currentCount = await this.mediaGroupCacheService.getProcessedCount(mediaGroupId);
+    if (myCount !== currentCount) {
+      return;
+    }
+
+    // We are the last — show the final result
+    await this.showUploadResult(session, messageId);
   }
 
   private async processBatchPhotos(
     photosData: TelegramPhotoData[],
     session: UserSessionEntity,
     user: TelegramBot.User,
-    sharedMessageId: number | null,
   ) {
-    // For single photos: send a fresh "Processing..." message.
-    // For album photos: reuse the shared message id passed in from processAlbumPhoto.
-    let processingMessageId: number;
-
-    if (sharedMessageId !== null) {
-      processingMessageId = sharedMessageId;
-    } else {
-      if (session.finishButtonMessageId) {
-        await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
-      }
-      const processingMsg = await this.telegramService.sendMessageToThread(
-        session.chatId,
-        session.threadId,
-        '⏳ Przetwarzanie zdjęć...',
-      );
-      processingMessageId = processingMsg.message_id;
+    if (session.finishButtonMessageId) {
+      await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
     }
 
+    const processingMsg = await this.telegramService.sendMessageToThread(
+      session.chatId,
+      session.threadId,
+      '⏳ Przetwarzanie zdjęć...',
+    );
+    const processingMessageId = processingMsg.message_id;
+
+    try {
+      await this.uploadAndSavePhoto(photosData[0], session, user);
+      await this.showUploadResult(session, processingMessageId);
+    } catch (error) {
+      this.logger.error(`Error processing photo: ${error.message}`);
+      await this.telegramService.editMessageText(
+        session.chatId,
+        processingMessageId,
+        `❌ Błąd podczas dodawania zdjęć: ${error.message}`,
+      );
+    }
+  }
+
+  private async uploadAndSavePhoto(
+    photoData: TelegramPhotoData,
+    session: UserSessionEntity,
+    user: TelegramBot.User,
+  ): Promise<void> {
+    const object = await this.objectsService.findById(session.objectId);
+    const maxPhotos = this.photosService.getMaxPhotosAllowed();
+    const currentCount = await this.photosService.countPhotosForStage(object.id, session.stageId);
+
+    if (currentCount >= maxPhotos) {
+      throw new Error(`Osiągnięto maksymalną liczbę ${maxPhotos} zdjęć.`);
+    }
+
+    const enriched = await this.uploadPhotosToDrive([photoData], object.name, session.stageName);
+    await this.photosService.addMultiplePhotos(object.id, session.stageId, enriched);
+    await this.historyService.recordPhotoAdded(
+      object.id,
+      session.stageId,
+      user.id.toString(),
+      user.username,
+    );
+  }
+
+  private async showUploadResult(session: UserSessionEntity, messageId: number): Promise<void> {
     try {
       const object = await this.objectsService.findById(session.objectId);
-      const currentCount = await this.photosService.countPhotosForStage(
-        object.id,
-        session.stageId,
-      );
-
+      const newCount = await this.photosService.countPhotosForStage(object.id, session.stageId);
       const maxPhotos = this.photosService.getMaxPhotosAllowed();
-
-      if (currentCount + photosData.length > maxPhotos) {
-        await this.telegramService.editMessageText(
-          session.chatId,
-          processingMessageId,
-          `❌ Nie można dodać ${photosData.length} zdjęć. Maksymalna liczba: ${maxPhotos}. Aktualnie: ${currentCount}.`,
-        );
-        return;
-      }
-
-      const enrichedPhotosData = await this.uploadPhotosToDrive(
-        photosData,
-        object.name,
-        session.stageName,
-      );
-
-      await this.photosService.addMultiplePhotos(
-        object.id,
-        session.stageId,
-        enrichedPhotosData,
-      );
-
-      await this.historyService.recordPhotoAdded(
-        object.id,
-        session.stageId,
-        user.id.toString(),
-        user.username,
-      );
-
-      const newCount = currentCount + photosData.length;
       const minRequired = this.photosService.getMinPhotosRequired();
 
       const resultText =
-        `✅ Dodano ${photosData.length} zdjęcie(a).\n\n` +
+        `✅ Dodano zdjęcia.\n\n` +
         `📷 <b>Etap ${session.stageIndex}: ${session.stageName}</b>\n` +
         `Łącznie: <b>${newCount}/${maxPhotos}</b>\n` +
         (newCount >= minRequired
@@ -257,27 +271,21 @@ export class TelegramUpdateHandler implements OnModuleInit {
           : `⚠️ Potrzeba jeszcze <b>${minRequired - newCount}</b> zdjęcie(a).`);
 
       const finishKeyboard = this.telegramService.createInlineKeyboard([
-        [
-          {
-            text: '✅ Zakończ dodawanie zdjęć',
-            callback_data: 'action:done_photos',
-          },
-        ],
+        [{ text: '✅ Zakończ dodawanie zdjęć', callback_data: 'action:done_photos' }],
       ]);
 
       await this.telegramService.editMessageText(
         session.chatId,
-        processingMessageId,
+        messageId,
         resultText,
         finishKeyboard,
       );
-
-      await this.sessionsService.update(session.id, { finishButtonMessageId: processingMessageId });
+      await this.sessionsService.update(session.id, { finishButtonMessageId: messageId });
     } catch (error) {
-      this.logger.error(`Error processing photos: ${error.message}`);
+      this.logger.error(`Error showing upload result: ${error.message}`);
       await this.telegramService.editMessageText(
         session.chatId,
-        processingMessageId,
+        messageId,
         `❌ Błąd podczas dodawania zdjęć: ${error.message}`,
       );
     }
