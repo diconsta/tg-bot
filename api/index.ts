@@ -6,27 +6,29 @@ import express from 'express';
 import type { IncomingMessage, ServerResponse } from 'http';
 
 const expressApp = express();
-let initialized = false;
+let initPromise: Promise<void> | null = null;
 
 async function bootstrap() {
-  if (!initialized) {
-    const adapter = new ExpressAdapter(expressApp);
-    const nestApp = await NestFactory.create(AppModule, adapter, {
-      logger: ['error', 'warn', 'log'],
-    });
+  if (initPromise === null) {
+    initPromise = (async () => {
+      const adapter = new ExpressAdapter(expressApp);
+      const nestApp = await NestFactory.create(AppModule, adapter, {
+        logger: ['error', 'warn', 'log'],
+      });
 
-    nestApp.useGlobalPipes(
-      new ValidationPipe({
-        whitelist: true,
-        forbidNonWhitelisted: true,
-        transform: true,
-      }),
-    );
+      nestApp.useGlobalPipes(
+        new ValidationPipe({
+          whitelist: true,
+          forbidNonWhitelisted: true,
+          transform: true,
+        }),
+      );
 
-    await nestApp.init();
-    initialized = true;
+      await nestApp.init();
+    })();
   }
 
+  await initPromise;
   return expressApp;
 }
 

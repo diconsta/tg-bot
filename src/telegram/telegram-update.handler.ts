@@ -33,13 +33,15 @@ export class TelegramUpdateHandler implements OnModuleInit {
 
   onModuleInit() {
     this.bot = this.telegramService.getBot();
-    this.setupHandlers();
     this.logger.log('Telegram update handlers registered');
   }
 
-  private setupHandlers() {
-    this.bot.on('message', (msg) => this.handleMessage(msg));
-    this.bot.on('callback_query', (query) => this.handleCallbackQuery(query));
+  async handleUpdate(update: TelegramBot.Update): Promise<void> {
+    if (update.message) {
+      await this.handleMessage(update.message);
+    } else if (update.callback_query) {
+      await this.handleCallbackQuery(update.callback_query);
+    }
   }
 
   private async handleMessage(msg: TelegramBot.Message) {

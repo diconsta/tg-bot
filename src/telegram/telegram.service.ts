@@ -34,9 +34,6 @@ export class TelegramService implements OnModuleInit {
     this.logger.log('Telegram bot initialized (webhook mode)');
   }
 
-  processUpdate(update: TelegramBot.Update): void {
-    this.bot.processUpdate(update);
-  }
 
   getBot(): TelegramBot {
     return this.bot;
