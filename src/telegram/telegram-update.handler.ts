@@ -10,6 +10,7 @@ import { CoordinatorsService } from '../coordinators/coordinators.service';
 import { GoogleDriveStorageService } from '../storage/google-drive-storage.service';
 import { SessionsService } from '../sessions/sessions.service';
 import { MediaGroupCacheService } from '../sessions/media-group-cache.service';
+import { PendingPhoto } from '../sessions/entities/media-group-cache.entity';
 import { UserSessionEntity } from '../sessions/entities/user-session.entity';
 
 @Injectable()
@@ -180,27 +181,73 @@ export class TelegramUpdateHandler implements OnModuleInit {
       await this.telegramService.deleteMessage(session.chatId, session.finishButtonMessageId);
     }
 
-    // Upload and save this photo
-    try {
-      await this.uploadAndSavePhoto(photoData, session, user);
-    } catch (error) {
-      this.logger.error(`Error uploading album photo: ${error.message}`);
-    }
+    // Queue this photo in DB immediately (fast write, no Drive upload yet)
+    await this.mediaGroupCacheService.appendPendingPhoto(mediaGroupId, {
+      fileId: photoData.fileId,
+      fileUniqueId: photoData.fileUniqueId,
+      fileSize: photoData.fileSize,
+    });
 
-    // Atomically increment processedCount, get our sequence number
-    const myCount = await this.mediaGroupCacheService.incrementProcessed(mediaGroupId);
+    // Wait for other invocations to also queue their photos
+    await new Promise<void>(resolve => setTimeout(resolve, 3000));
 
-    // Wait for other concurrent invocations to finish processing
-    await new Promise<void>(resolve => setTimeout(resolve, 5000));
-
-    // Check if we are still the last — if another invocation incremented after us, let it handle the result
-    const currentCount = await this.mediaGroupCacheService.getProcessedCount(mediaGroupId);
-    if (myCount !== currentCount) {
+    // Atomically claim finalization — only one invocation wins
+    const won = await this.mediaGroupCacheService.tryFinalize(mediaGroupId);
+    if (!won) {
       return;
     }
 
-    // We are the last — show the final result
-    await this.showUploadResult(session, messageId);
+    // We won — process all queued photos at once
+    const pendingPhotos: PendingPhoto[] =
+      await this.mediaGroupCacheService.getPendingPhotos(mediaGroupId);
+    const object = await this.objectsService.findById(session.objectId);
+    const maxPhotos = this.photosService.getMaxPhotosAllowed();
+    const currentCount = await this.photosService.countPhotosForStage(
+      object.id,
+      session.stageId,
+    );
+
+    if (currentCount + pendingPhotos.length > maxPhotos) {
+      await this.telegramService.editMessageText(
+        session.chatId,
+        messageId,
+        `❌ Nie można dodać ${pendingPhotos.length} zdjęć. Maksymalna liczba: ${maxPhotos}. Aktualnie: ${currentCount}.`,
+      );
+      return;
+    }
+
+    try {
+      const photosToUpload: TelegramPhotoData[] = pendingPhotos.map(p => ({
+        fileId: p.fileId,
+        fileUniqueId: p.fileUniqueId,
+        fileSize: p.fileSize,
+      }));
+      const enriched = await this.uploadPhotosToDrive(
+        photosToUpload,
+        object.name,
+        session.stageName,
+      );
+      await this.photosService.addMultiplePhotos(
+        object.id,
+        session.stageId,
+        enriched,
+      );
+      await this.historyService.recordPhotoAdded(
+        object.id,
+        session.stageId,
+        user.id.toString(),
+        user.username,
+      );
+      await this.showUploadResult(session, messageId);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Error processing album batch: ${msg}`);
+      await this.telegramService.editMessageText(
+        session.chatId,
+        messageId,
+        `❌ Błąd podczas dodawania zdjęć: ${msg}`,
+      );
+    }
   }
 
   private async processBatchPhotos(

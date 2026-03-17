@@ -1,5 +1,11 @@
 import { Entity, Column, PrimaryColumn, CreateDateColumn } from 'typeorm';
 
+export interface PendingPhoto {
+  fileId: string;
+  fileUniqueId: string;
+  fileSize?: number;
+}
+
 @Entity('media_group_cache')
 export class MediaGroupCacheEntity {
   @PrimaryColumn()
@@ -14,8 +20,11 @@ export class MediaGroupCacheEntity {
   @Column()
   threadId: string;
 
-  @Column({ default: 0 })
-  processedCount: number;
+  @Column({ type: 'jsonb', default: '[]' })
+  pendingPhotos: PendingPhoto[];
+
+  @Column({ default: false })
+  finalized: boolean;
 
   @CreateDateColumn()
   createdAt: Date;

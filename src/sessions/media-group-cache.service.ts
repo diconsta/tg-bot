@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { MediaGroupCacheEntity } from './entities/media-group-cache.entity';
+import {
+  MediaGroupCacheEntity,
+  PendingPhoto,
+} from './entities/media-group-cache.entity';
 
 @Injectable()
 export class MediaGroupCacheService {
@@ -9,10 +12,6 @@ export class MediaGroupCacheService {
     @InjectRepository(MediaGroupCacheEntity)
     private readonly repo: Repository<MediaGroupCacheEntity>,
   ) {}
-
-  async get(mediaGroupId: string): Promise<MediaGroupCacheEntity | null> {
-    return this.repo.findOne({ where: { mediaGroupId } });
-  }
 
   /**
    * Inserts if not exists (ON CONFLICT DO NOTHING).
@@ -43,22 +42,39 @@ export class MediaGroupCacheService {
   }
 
   /**
-   * Atomically increments processedCount and returns the new value.
-   * Used to determine which invocation is the last one for an album.
+   * Atomically appends a photo to the pendingPhotos JSON array.
    */
-  async incrementProcessed(mediaGroupId: string): Promise<number> {
+  async appendPendingPhoto(
+    mediaGroupId: string,
+    photo: PendingPhoto,
+  ): Promise<void> {
+    await this.repo
+      .createQueryBuilder()
+      .update(MediaGroupCacheEntity)
+      .set({ pendingPhotos: () => `"pendingPhotos" || :photo::jsonb` })
+      .setParameter('photo', JSON.stringify([photo]))
+      .where('"mediaGroupId" = :mediaGroupId', { mediaGroupId })
+      .execute();
+  }
+
+  async getPendingPhotos(mediaGroupId: string): Promise<PendingPhoto[]> {
+    const entity = await this.repo.findOne({ where: { mediaGroupId } });
+    return entity?.pendingPhotos ?? [];
+  }
+
+  /**
+   * Atomically claims finalization. Returns true only for the one invocation
+   * that successfully flips finalized from false → true.
+   */
+  async tryFinalize(mediaGroupId: string): Promise<boolean> {
     const result = await this.repo
       .createQueryBuilder()
       .update(MediaGroupCacheEntity)
-      .set({ processedCount: () => '"processedCount" + 1' })
-      .where('"mediaGroupId" = :mediaGroupId', { mediaGroupId })
-      .returning('"processedCount"')
+      .set({ finalized: true })
+      .where('"mediaGroupId" = :mediaGroupId AND "finalized" = false', {
+        mediaGroupId,
+      })
       .execute();
-    return result.raw[0].processedCount as number;
-  }
-
-  async getProcessedCount(mediaGroupId: string): Promise<number> {
-    const entity = await this.repo.findOne({ where: { mediaGroupId } });
-    return entity?.processedCount ?? 0;
+    return (result.affected ?? 0) > 0;
   }
 }
