@@ -14,7 +14,12 @@ export default registerAs(
     migrations: [__dirname + '/../database/migrations/*{.ts,.js}'],
     synchronize: process.env.NODE_ENV === 'development',
     logging: process.env.NODE_ENV === 'development',
-    migrationsRun: false,
+    migrationsRun: true,
     ssl: Boolean(process.env.DB_SSL),
+    extra: {
+      max: 2,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 3000,
+    },
   }),
 );

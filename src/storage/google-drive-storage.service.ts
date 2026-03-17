@@ -15,7 +15,6 @@ export class GoogleDriveStorageService {
   private readonly logger = new Logger(GoogleDriveStorageService.name);
   private driveClient: drive_v3.Drive | null = null;
   private sharedDriveId: string;
-  private folderCache: Map<string, string> = new Map();
 
   constructor(private configService: ConfigService) {
     this.sharedDriveId = this.configService.get<string>('app.googleDrive.sharedDriveId');
@@ -23,20 +22,33 @@ export class GoogleDriveStorageService {
   }
 
   private initializeDrive() {
+    const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
     const serviceAccountPath = this.configService.get<string>('app.googleDrive.serviceAccountPath');
 
-    if (!serviceAccountPath || !this.sharedDriveId) {
-      this.logger.warn('Google Drive not configured - storage disabled');
-      this.logger.warn('Set GOOGLE_SERVICE_ACCOUNT_PATH and GOOGLE_SHARED_DRIVE_ID in .env');
+    if (!this.sharedDriveId) {
+      this.logger.warn('Google Drive not configured - GOOGLE_SHARED_DRIVE_ID missing');
       return;
     }
 
     try {
-      const auth = new google.auth.GoogleAuth({
-        keyFile: serviceAccountPath,
-        scopes: ['https://www.googleapis.com/auth/drive.file'],
-      });
+      let credentials: object | undefined;
 
+      if (serviceAccountJson) {
+        credentials = JSON.parse(serviceAccountJson);
+      }
+
+      const authOptions = credentials
+        ? { credentials, scopes: ['https://www.googleapis.com/auth/drive.file'] }
+        : serviceAccountPath
+          ? { keyFile: serviceAccountPath, scopes: ['https://www.googleapis.com/auth/drive.file'] }
+          : null;
+
+      if (!authOptions) {
+        this.logger.warn('Google Drive not configured - set GOOGLE_SERVICE_ACCOUNT_JSON env var');
+        return;
+      }
+
+      const auth = new google.auth.GoogleAuth(authOptions);
       this.driveClient = google.drive({ version: 'v3', auth });
       this.logger.log(`Google Drive initialized with Shared Drive: ${this.sharedDriveId}`);
     } catch (error) {
@@ -44,10 +56,6 @@ export class GoogleDriveStorageService {
     }
   }
 
-  /**
-   * Upload a photo to Google Shared Drive
-   * Creates folder structure: Object Name / Stage Name / photo.jpg
-   */
   async uploadPhoto(
     buffer: Buffer,
     objectName: string,
@@ -58,110 +66,65 @@ export class GoogleDriveStorageService {
       throw new Error('Google Drive client not initialized');
     }
 
-    try {
-      // Get or create object folder
-      const objectFolderId = await this.getOrCreateFolder(objectName, this.sharedDriveId);
+    // Get or create folder structure (no in-memory cache — serverless safe)
+    const objectFolderId = await this.getOrCreateFolder(objectName, this.sharedDriveId);
+    const stageFolderId = await this.getOrCreateFolder(stageName, objectFolderId);
 
-      // Get or create stage folder inside object folder
-      const stageFolderId = await this.getOrCreateFolder(stageName, objectFolderId);
+    const bufferStream = new Readable();
+    bufferStream.push(buffer);
+    bufferStream.push(null);
 
-      // Create readable stream from buffer
-      const bufferStream = new Readable();
-      bufferStream.push(buffer);
-      bufferStream.push(null);
-
-      // Upload file to stage folder
-      const fileMetadata: drive_v3.Schema$File = {
+    const response = await this.driveClient.files.create({
+      requestBody: {
         name: fileName,
         parents: [stageFolderId],
-      };
-
-      const media = {
+      },
+      media: {
         mimeType: 'image/jpeg',
         body: bufferStream,
-      };
+      },
+      fields: 'id, webViewLink',
+      supportsAllDrives: true,
+    });
 
-      const response = await this.driveClient.files.create({
-        requestBody: fileMetadata,
-        media: media,
-        fields: 'id, webViewLink',
-        supportsAllDrives: true, // Required for Shared Drives
-      });
+    this.logger.log(`Photo uploaded to Shared Drive: ${fileName} (${response.data.id})`);
 
-      const fileId = response.data.id;
-      const webViewLink = response.data.webViewLink;
-
-      this.logger.log(`Photo uploaded to Shared Drive: ${fileName} (${fileId})`);
-
-      return {
-        driveFileId: fileId,
-        driveUrl: webViewLink,
-        driveFolderPath: `${objectName}/${stageName}`,
-      };
-    } catch (error) {
-      this.logger.error(`Failed to upload to Google Drive: ${error.message}`, error.stack);
-      throw error;
-    }
+    return {
+      driveFileId: response.data.id,
+      driveUrl: response.data.webViewLink,
+      driveFolderPath: `${objectName}/${stageName}`,
+    };
   }
 
-  /**
-   * Get or create a folder in Shared Drive
-   */
   private async getOrCreateFolder(folderName: string, parentId: string): Promise<string> {
-    const cacheKey = `${parentId}:${folderName}`;
+    const response = await this.driveClient.files.list({
+      q: `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id)',
+      spaces: 'drive',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'drive',
+      driveId: this.sharedDriveId,
+    });
 
-    // Check cache first
-    if (this.folderCache.has(cacheKey)) {
-      return this.folderCache.get(cacheKey);
+    if (response.data.files?.length > 0) {
+      return response.data.files[0].id;
     }
 
-    try {
-      // Search for existing folder
-      const response = await this.driveClient.files.list({
-        q: `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        fields: 'files(id, name)',
-        spaces: 'drive',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        corpora: 'drive',
-        driveId: this.sharedDriveId,
-      });
-
-      if (response.data.files && response.data.files.length > 0) {
-        // Folder exists
-        const folderId = response.data.files[0].id;
-        this.folderCache.set(cacheKey, folderId);
-        this.logger.debug(`Found existing folder: ${folderName} (${folderId})`);
-        return folderId;
-      }
-
-      // Create new folder
-      const folderMetadata: drive_v3.Schema$File = {
+    const folderResponse = await this.driveClient.files.create({
+      requestBody: {
         name: folderName,
         mimeType: 'application/vnd.google-apps.folder',
         parents: [parentId],
-      };
+      },
+      fields: 'id',
+      supportsAllDrives: true,
+    });
 
-      const folderResponse = await this.driveClient.files.create({
-        requestBody: folderMetadata,
-        fields: 'id',
-        supportsAllDrives: true,
-      });
-
-      const folderId = folderResponse.data.id;
-      this.folderCache.set(cacheKey, folderId);
-      this.logger.log(`Created folder: ${folderName} (${folderId})`);
-
-      return folderId;
-    } catch (error) {
-      this.logger.error(`Error managing folder ${folderName}: ${error.message}`);
-      throw error;
-    }
+    this.logger.log(`Created Drive folder: ${folderName} (${folderResponse.data.id})`);
+    return folderResponse.data.id;
   }
 
-  /**
-   * Check if Google Drive is enabled and configured
-   */
   isEnabled(): boolean {
     return !!this.driveClient;
   }

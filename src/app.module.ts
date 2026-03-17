@@ -12,6 +12,7 @@ import { HistoryModule } from './history/history.module';
 import { CoordinatorsModule } from './coordinators/coordinators.module';
 import { TelegramModule } from './telegram/telegram.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
+import { SessionsModule } from './sessions/sessions.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { SchedulerModule } from './scheduler/scheduler.module';
     CoordinatorsModule,
     TelegramModule,
     SchedulerModule,
+    SessionsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

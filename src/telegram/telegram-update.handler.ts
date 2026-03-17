@@ -8,17 +8,13 @@ import { PhotosService, TelegramPhotoData } from '../photos/photos.service';
 import { HistoryService } from '../history/history.service';
 import { CoordinatorsService } from '../coordinators/coordinators.service';
 import { GoogleDriveStorageService } from '../storage/google-drive-storage.service';
-import {
-  UserSession,
-  UserSessionState,
-} from './interfaces/user-session.interface';
+import { SessionsService } from '../sessions/sessions.service';
+import { UserSessionEntity } from '../sessions/entities/user-session.entity';
 
 @Injectable()
 export class TelegramUpdateHandler implements OnModuleInit {
   private readonly logger = new Logger(TelegramUpdateHandler.name);
   private bot: TelegramBot;
-  private userSessions: Map<string, UserSession> = new Map();
-  private mediaGroups: Map<string, TelegramPhotoData[]> = new Map();
 
   constructor(
     private telegramService: TelegramService,
@@ -29,6 +25,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     private historyService: HistoryService,
     private coordinatorsService: CoordinatorsService,
     private googleDriveStorage: GoogleDriveStorageService,
+    private sessionsService: SessionsService,
   ) {}
 
   onModuleInit() {
@@ -138,10 +135,9 @@ export class TelegramUpdateHandler implements OnModuleInit {
       return;
     }
 
-    const sessionKey = this.getSessionKey(userId, chatId, threadId);
-    const session = this.userSessions.get(sessionKey);
+    const session = await this.sessionsService.get(userId, chatId, threadId);
 
-    if (!session || session.state !== UserSessionState.AWAITING_PHOTOS) {
+    if (!session || session.state !== 'AWAITING_PHOTOS') {
       return;
     }
 
@@ -152,53 +148,12 @@ export class TelegramUpdateHandler implements OnModuleInit {
       fileSize: photo.file_size,
     };
 
-    if (msg.media_group_id) {
-      await this.handleMediaGroupPhoto(
-        msg.media_group_id,
-        photoData,
-        session,
-        msg.from,
-      );
-    } else {
-      await this.handleSinglePhoto(photoData, session, msg.from);
-    }
-  }
-
-  private async handleMediaGroupPhoto(
-    mediaGroupId: string,
-    photoData: TelegramPhotoData,
-    session: UserSession,
-    user: TelegramBot.User,
-  ) {
-    if (!this.mediaGroups.has(mediaGroupId)) {
-      this.mediaGroups.set(mediaGroupId, []);
-    }
-
-    this.mediaGroups.get(mediaGroupId).push(photoData);
-
-    if (session.mediaGroupTimeout) {
-      clearTimeout(session.mediaGroupTimeout);
-    }
-
-    session.mediaGroupTimeout = setTimeout(async () => {
-      const photos = this.mediaGroups.get(mediaGroupId);
-      this.mediaGroups.delete(mediaGroupId);
-
-      await this.processBatchPhotos(photos, session, user);
-    }, 1000);
-  }
-
-  private async handleSinglePhoto(
-    photoData: TelegramPhotoData,
-    session: UserSession,
-    user: TelegramBot.User,
-  ) {
-    await this.processBatchPhotos([photoData], session, user);
+    await this.processBatchPhotos([photoData], session, msg.from);
   }
 
   private async processBatchPhotos(
     photosData: TelegramPhotoData[],
-    session: UserSession,
+    session: UserSessionEntity,
     user: TelegramBot.User,
   ) {
     const processingMsg = await this.telegramService.sendProcessingMessage(
@@ -263,7 +218,6 @@ export class TelegramUpdateHandler implements OnModuleInit {
           session.chatId,
           session.finishButtonMessageId,
         );
-        session.finishButtonMessageId = undefined;
       }
 
       await this.telegramService.sendMessageToThread(
@@ -287,7 +241,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
         `Kliknij „Zakończ", gdy skończysz dodawać zdjęcia.`,
         finishKeyboard,
       );
-      session.finishButtonMessageId = finishMsg.message_id;
+      await this.sessionsService.update(session.id, { finishButtonMessageId: finishMsg.message_id });
 
       // Don't clear session - allow user to continue adding photos
       // Session will be cleared when user completes stage or cancels
@@ -428,18 +382,8 @@ export class TelegramUpdateHandler implements OnModuleInit {
       return;
     }
 
-    const sessionKey = this.getSessionKey(userId, chatId, threadId);
-    this.userSessions.set(sessionKey, {
-      userId,
-      chatId,
-      threadId,
-      state: UserSessionState.AWAITING_PHOTOS,
-      objectId: object.id,
-      stageId: object.currentStageId,
-      stageIndex: object.currentStage.stageIndex,
-      stageName: object.currentStage.stageName,
-      photoBuffer: [],
-    });
+    // Delete any existing session first, then create a new one
+    await this.sessionsService.delete(userId, chatId, threadId);
 
     const minPhotos = this.photosService.getMinPhotosRequired();
 
@@ -459,10 +403,17 @@ export class TelegramUpdateHandler implements OnModuleInit {
       keyboard,
     );
 
-    const session = this.userSessions.get(sessionKey);
-    if (session) {
-      session.finishButtonMessageId = sentMsg.message_id;
-    }
+    await this.sessionsService.create({
+      userId,
+      chatId,
+      threadId,
+      state: 'AWAITING_PHOTOS',
+      objectId: object.id,
+      stageId: object.currentStageId,
+      stageIndex: object.currentStage.stageIndex,
+      stageName: object.currentStage.stageName,
+      finishButtonMessageId: sentMsg.message_id,
+    });
   }
 
   private async handleDonePhotosAction(
@@ -473,12 +424,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     const chatId = query.message.chat.id.toString();
     const threadId = object.telegramThreadId;
 
-    const sessionKey = this.getSessionKey(userId, chatId, threadId);
-    const session = this.userSessions.get(sessionKey);
-
-    if (session) {
-      this.clearUserSession(session);
-    }
+    await this.sessionsService.delete(userId, chatId, threadId);
 
     const currentCount = await this.photosService.countPhotosForStage(
       object.id,
@@ -550,11 +496,7 @@ export class TelegramUpdateHandler implements OnModuleInit {
     const updatedObject = await this.objectsService.progressToNextStage(object.id);
 
     // Clear any active photo upload session
-    const sessionKey = this.getSessionKey(userId, chatId, threadId);
-    const session = this.userSessions.get(sessionKey);
-    if (session) {
-      this.clearUserSession(session);
-    }
+    await this.sessionsService.delete(userId, chatId, threadId);
 
     // Add debug logging
     this.logger.debug(`Updated object currentStageId: ${updatedObject.currentStageId}`);
@@ -644,24 +586,6 @@ export class TelegramUpdateHandler implements OnModuleInit {
 
   private formatWelcomeMessage(objectName: string, firstStageName: string): string {
     return `🏗 <b>Nowy obiekt utworzony</b>\n\nObiekt: <b>${objectName}</b>\nEtap: <b>1 — ${firstStageName}</b>\n\nSkorzystaj z przycisków poniżej, aby zarządzać tym obiektem.`;
-  }
-
-  private getSessionKey(userId: string, chatId: string, threadId: string): string {
-    return `${userId}_${chatId}_${threadId}`;
-  }
-
-  private clearUserSession(session: UserSession) {
-    const sessionKey = this.getSessionKey(
-      session.userId,
-      session.chatId,
-      session.threadId,
-    );
-
-    if (session.mediaGroupTimeout) {
-      clearTimeout(session.mediaGroupTimeout);
-    }
-
-    this.userSessions.delete(sessionKey);
   }
 
   private async handleViewPhotosAction(

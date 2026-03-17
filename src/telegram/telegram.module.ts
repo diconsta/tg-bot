@@ -9,6 +9,7 @@ import { PhotosModule } from '../photos/photos.module';
 import { HistoryModule } from '../history/history.module';
 import { CoordinatorsModule } from '../coordinators/coordinators.module';
 import { StorageModule } from '../storage/storage.module';
+import { SessionsModule } from '../sessions/sessions.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { StorageModule } from '../storage/storage.module';
     HistoryModule,
     CoordinatorsModule,
     StorageModule,
+    SessionsModule,
   ],
   controllers: [TelegramWebhookController],
   providers: [

@@ -3,13 +3,42 @@
   "builds": [
     {
       "src": "api/index.ts",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": { "maxDuration": 60 }
+    },
+    {
+      "src": "api/cron/daily-reminder.ts",
+      "use": "@vercel/node",
+      "config": { "maxDuration": 60 }
+    },
+    {
+      "src": "api/cron/stalled-alert.ts",
+      "use": "@vercel/node",
+      "config": { "maxDuration": 60 }
     }
   ],
   "routes": [
     {
+      "src": "/api/cron/daily-reminder",
+      "dest": "api/cron/daily-reminder.ts"
+    },
+    {
+      "src": "/api/cron/stalled-alert",
+      "dest": "api/cron/stalled-alert.ts"
+    },
+    {
       "src": "/(.*)",
       "dest": "api/index.ts"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily-reminder",
+      "schedule": "0 14 * * *"
+    },
+    {
+      "path": "/api/cron/stalled-alert",
+      "schedule": "0 8 * * *"
     }
   ]
 }
