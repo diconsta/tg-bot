@@ -44,10 +44,23 @@ export class GoogleDriveStorageService {
         credentials = JSON.parse<ServiceAccountCredentials>(serviceAccountJson);
 
         if (credentials.private_key) {
-          // 🔥 КРИТИЧНО
+          // 🔥 КРИТИЧНО - Fix escaped newlines in private key
+          const originalLength = credentials.private_key.length;
           credentials.private_key = credentials.private_key
             .replace(/\\n/g, '\n')
             .replace(/\r/g, '');
+
+          this.logger.debug(
+            `Private key processed: ${originalLength} -> ${credentials.private_key.length} chars`,
+          );
+
+          // Validate private key format
+          if (!credentials.private_key.includes('-----BEGIN PRIVATE KEY-----')) {
+            this.logger.error('Private key missing BEGIN marker');
+          }
+          if (!credentials.private_key.includes('-----END PRIVATE KEY-----')) {
+            this.logger.error('Private key missing END marker');
+          }
         }
       }
 
@@ -73,7 +86,8 @@ export class GoogleDriveStorageService {
         `Google Drive initialized with Shared Drive: ${this.sharedDriveId}`,
       );
     } catch (error) {
-      this.logger.error(`Failed to initialize Google Drive: ${error.message}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Failed to initialize Google Drive: ${errorMessage}`);
     }
   }
 
@@ -131,11 +145,13 @@ export class GoogleDriveStorageService {
         driveFolderPath: `${objectName}/${stageName}`,
       };
     } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
       this.logger.error(
-        `Failed to upload photo ${fileName} to ${objectName}/${stageName}: ${error.message}`,
+        `Failed to upload photo ${fileName} to ${objectName}/${stageName}: ${errorMessage}`,
       );
       throw new Error(
-        `Failed to upload photo to Google Drive: ${error.message}`,
+        `Failed to upload photo to Google Drive: ${errorMessage}`,
       );
     }
   }
@@ -189,11 +205,12 @@ export class GoogleDriveStorageService {
       );
       return folderResponse.data.id;
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
       this.logger.error(
-        `Error in getOrCreateFolder for "${folderName}" in parent ${parentId}: ${error.message}`,
+        `Error in getOrCreateFolder for "${folderName}" in parent ${parentId}: ${errorMessage}`,
       );
       throw new Error(
-        `Failed to get or create folder "${folderName}": ${error.message}`,
+        `Failed to get or create folder "${folderName}": ${errorMessage}`,
       );
     }
   }
