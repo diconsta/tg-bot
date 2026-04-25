@@ -35,12 +35,19 @@ export class GoogleDriveStorageService {
 
       if (serviceAccountJson) {
         credentials = JSON.parse(serviceAccountJson);
+
+        if (credentials.private_key) {
+          // 🔥 КРИТИЧНО
+          credentials.private_key = credentials.private_key
+            .replace(/\\n/g, '\n')
+            .replace(/\r/g, '');
+        }
       }
 
       const authOptions = credentials
-        ? { credentials, scopes: ['https://www.googleapis.com/auth/drive.file'] }
+        ? { credentials, scopes: ['https://www.googleapis.com/auth/drive'] }
         : serviceAccountPath
-          ? { keyFile: serviceAccountPath, scopes: ['https://www.googleapis.com/auth/drive.file'] }
+          ? { keyFile: serviceAccountPath, scopes: ['https://www.googleapis.com/auth/drive'] }
           : null;
 
       if (!authOptions) {
