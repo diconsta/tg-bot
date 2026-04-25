@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { google } from 'googleapis';
 import { drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
+import { ServiceAccountCredentials } from './serviceAccountCredentials.model';
 
 export interface DriveUploadResult {
   driveFileId: string;
@@ -17,24 +18,30 @@ export class GoogleDriveStorageService {
   private sharedDriveId: string;
 
   constructor(private configService: ConfigService) {
-    this.sharedDriveId = this.configService.get<string>('app.googleDrive.sharedDriveId');
+    this.sharedDriveId = this.configService.get<string>(
+      'app.googleDrive.sharedDriveId',
+    );
     this.initializeDrive();
   }
 
   private initializeDrive() {
     const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-    const serviceAccountPath = this.configService.get<string>('app.googleDrive.serviceAccountPath');
+    const serviceAccountPath = this.configService.get<string>(
+      'app.googleDrive.serviceAccountPath',
+    );
 
     if (!this.sharedDriveId) {
-      this.logger.warn('Google Drive not configured - GOOGLE_SHARED_DRIVE_ID missing');
+      this.logger.warn(
+        'Google Drive not configured - GOOGLE_SHARED_DRIVE_ID missing',
+      );
       return;
     }
 
     try {
-      let credentials: object | undefined;
+      let credentials: ServiceAccountCredentials | undefined;
 
       if (serviceAccountJson) {
-        credentials = JSON.parse(serviceAccountJson);
+        credentials = JSON.parse<ServiceAccountCredentials>(serviceAccountJson);
 
         if (credentials.private_key) {
           // 🔥 КРИТИЧНО
@@ -47,17 +54,24 @@ export class GoogleDriveStorageService {
       const authOptions = credentials
         ? { credentials, scopes: ['https://www.googleapis.com/auth/drive'] }
         : serviceAccountPath
-          ? { keyFile: serviceAccountPath, scopes: ['https://www.googleapis.com/auth/drive'] }
+          ? {
+              keyFile: serviceAccountPath,
+              scopes: ['https://www.googleapis.com/auth/drive'],
+            }
           : null;
 
       if (!authOptions) {
-        this.logger.warn('Google Drive not configured - set GOOGLE_SERVICE_ACCOUNT_JSON env var');
+        this.logger.warn(
+          'Google Drive not configured - set GOOGLE_SERVICE_ACCOUNT_JSON env var',
+        );
         return;
       }
 
       const auth = new google.auth.GoogleAuth(authOptions);
       this.driveClient = google.drive({ version: 'v3', auth });
-      this.logger.log(`Google Drive initialized with Shared Drive: ${this.sharedDriveId}`);
+      this.logger.log(
+        `Google Drive initialized with Shared Drive: ${this.sharedDriveId}`,
+      );
     } catch (error) {
       this.logger.error(`Failed to initialize Google Drive: ${error.message}`);
     }
@@ -74,8 +88,14 @@ export class GoogleDriveStorageService {
     }
 
     // Get or create folder structure (no in-memory cache — serverless safe)
-    const objectFolderId = await this.getOrCreateFolder(objectName, this.sharedDriveId);
-    const stageFolderId = await this.getOrCreateFolder(stageName, objectFolderId);
+    const objectFolderId = await this.getOrCreateFolder(
+      objectName,
+      this.sharedDriveId,
+    );
+    const stageFolderId = await this.getOrCreateFolder(
+      stageName,
+      objectFolderId,
+    );
 
     const bufferStream = new Readable();
     bufferStream.push(buffer);
@@ -94,7 +114,9 @@ export class GoogleDriveStorageService {
       supportsAllDrives: true,
     });
 
-    this.logger.log(`Photo uploaded to Shared Drive: ${fileName} (${response.data.id})`);
+    this.logger.log(
+      `Photo uploaded to Shared Drive: ${fileName} (${response.data.id})`,
+    );
 
     return {
       driveFileId: response.data.id,
@@ -103,7 +125,10 @@ export class GoogleDriveStorageService {
     };
   }
 
-  private async getOrCreateFolder(folderName: string, parentId: string): Promise<string> {
+  private async getOrCreateFolder(
+    folderName: string,
+    parentId: string,
+  ): Promise<string> {
     const response = await this.driveClient.files.list({
       q: `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
       fields: 'files(id)',
@@ -128,7 +153,9 @@ export class GoogleDriveStorageService {
       supportsAllDrives: true,
     });
 
-    this.logger.log(`Created Drive folder: ${folderName} (${folderResponse.data.id})`);
+    this.logger.log(
+      `Created Drive folder: ${folderName} (${folderResponse.data.id})`,
+    );
     return folderResponse.data.id;
   }
 
