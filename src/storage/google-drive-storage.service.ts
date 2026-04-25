@@ -87,76 +87,115 @@ export class GoogleDriveStorageService {
       throw new Error('Google Drive client not initialized');
     }
 
-    // Get or create folder structure (no in-memory cache — serverless safe)
-    const objectFolderId = await this.getOrCreateFolder(
-      objectName,
-      this.sharedDriveId,
-    );
-    const stageFolderId = await this.getOrCreateFolder(
-      stageName,
-      objectFolderId,
-    );
+    try {
+      // Get or create folder structure (no in-memory cache — serverless safe)
+      this.logger.debug(
+        `Ensuring folder structure exists: ${objectName}/${stageName}`,
+      );
 
-    const bufferStream = new Readable();
-    bufferStream.push(buffer);
-    bufferStream.push(null);
+      const objectFolderId = await this.getOrCreateFolder(
+        objectName,
+        this.sharedDriveId,
+      );
+      const stageFolderId = await this.getOrCreateFolder(
+        stageName,
+        objectFolderId,
+      );
 
-    const response = await this.driveClient.files.create({
-      requestBody: {
-        name: fileName,
-        parents: [stageFolderId],
-      },
-      media: {
-        mimeType: 'image/jpeg',
-        body: bufferStream,
-      },
-      fields: 'id, webViewLink',
-      supportsAllDrives: true,
-    });
+      this.logger.debug(`Uploading ${fileName} to folder ${stageFolderId}`);
 
-    this.logger.log(
-      `Photo uploaded to Shared Drive: ${fileName} (${response.data.id})`,
-    );
+      const bufferStream = new Readable();
+      bufferStream.push(buffer);
+      bufferStream.push(null);
 
-    return {
-      driveFileId: response.data.id,
-      driveUrl: response.data.webViewLink,
-      driveFolderPath: `${objectName}/${stageName}`,
-    };
+      const response = await this.driveClient.files.create({
+        requestBody: {
+          name: fileName,
+          parents: [stageFolderId],
+        },
+        media: {
+          mimeType: 'image/jpeg',
+          body: bufferStream,
+        },
+        fields: 'id, webViewLink',
+        supportsAllDrives: true,
+      });
+
+      this.logger.log(
+        `Photo uploaded to Shared Drive: ${fileName} (${response.data.id}) in ${objectName}/${stageName}`,
+      );
+
+      return {
+        driveFileId: response.data.id,
+        driveUrl: response.data.webViewLink,
+        driveFolderPath: `${objectName}/${stageName}`,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to upload photo ${fileName} to ${objectName}/${stageName}: ${error.message}`,
+      );
+      throw new Error(
+        `Failed to upload photo to Google Drive: ${error.message}`,
+      );
+    }
   }
 
   private async getOrCreateFolder(
     folderName: string,
     parentId: string,
   ): Promise<string> {
-    const response = await this.driveClient.files.list({
-      q: `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: 'files(id)',
-      spaces: 'drive',
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      corpora: 'drive',
-      driveId: this.sharedDriveId,
-    });
+    try {
+      // Search for existing folder
+      const response = await this.driveClient.files.list({
+        q: `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        fields: 'files(id)',
+        spaces: 'drive',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        corpora: 'drive',
+        driveId: this.sharedDriveId,
+      });
 
-    if (response.data.files?.length > 0) {
-      return response.data.files[0].id;
+      if (response.data.files?.length > 0) {
+        this.logger.debug(
+          `Found existing folder: ${folderName} (${response.data.files[0].id})`,
+        );
+        return response.data.files[0].id;
+      }
+
+      // Folder doesn't exist, create it
+      this.logger.log(
+        `Folder "${folderName}" not found in parent ${parentId}, creating...`,
+      );
+
+      const folderResponse = await this.driveClient.files.create({
+        requestBody: {
+          name: folderName,
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: [parentId],
+        },
+        fields: 'id',
+        supportsAllDrives: true,
+      });
+
+      if (!folderResponse.data.id) {
+        throw new Error(
+          `Failed to create folder "${folderName}": No folder ID returned`,
+        );
+      }
+
+      this.logger.log(
+        `Successfully created folder: ${folderName} (${folderResponse.data.id})`,
+      );
+      return folderResponse.data.id;
+    } catch (error) {
+      this.logger.error(
+        `Error in getOrCreateFolder for "${folderName}" in parent ${parentId}: ${error.message}`,
+      );
+      throw new Error(
+        `Failed to get or create folder "${folderName}": ${error.message}`,
+      );
     }
-
-    const folderResponse = await this.driveClient.files.create({
-      requestBody: {
-        name: folderName,
-        mimeType: 'application/vnd.google-apps.folder',
-        parents: [parentId],
-      },
-      fields: 'id',
-      supportsAllDrives: true,
-    });
-
-    this.logger.log(
-      `Created Drive folder: ${folderName} (${folderResponse.data.id})`,
-    );
-    return folderResponse.data.id;
   }
 
   isEnabled(): boolean {
