@@ -47,6 +47,13 @@ export class DailyReminderJob implements OnModuleInit {
   async sendDailyReminders() {
     this.logger.log('Starting daily reminder job...');
 
+    // Skip notifications on weekends (Saturday = 6, Sunday = 0)
+    const today = new Date().getDay();
+    if (today === 0 || today === 6) {
+      this.logger.log('Skipping daily reminder - today is a weekend');
+      return;
+    }
+
     try {
       const objects = await this.objectsService.findObjectsForReminder();
 

@@ -27,6 +27,13 @@ export class StalledStageAlertJob {
   async sendStalledStageAlerts() {
     this.logger.log('Starting stalled stage alert job...');
 
+    // Skip notifications on weekends (Saturday = 6, Sunday = 0)
+    const today = new Date().getDay();
+    if (today === 0 || today === 6) {
+      this.logger.log('Skipping stalled stage alert - today is a weekend');
+      return;
+    }
+
     try {
       const stalledObjects = await this.objectsService.findStalledStages(
         this.stalledDays,

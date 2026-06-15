@@ -41,7 +41,9 @@ export class GoogleDriveStorageService {
       let credentials: ServiceAccountCredentials | undefined;
 
       if (serviceAccountJson) {
-        credentials = JSON.parse<ServiceAccountCredentials>(serviceAccountJson);
+        credentials = JSON.parse(
+          serviceAccountJson,
+        ) as ServiceAccountCredentials;
 
         if (credentials.private_key) {
           // 🔥 КРИТИЧНО - Fix escaped newlines in private key

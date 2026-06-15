@@ -34,11 +34,11 @@
   "crons": [
     {
       "path": "/api/cron/daily-reminder",
-      "schedule": "0 14 * * *"
+      "schedule": "0 14 * * 1-5"
     },
     {
       "path": "/api/cron/stalled-alert",
-      "schedule": "0 8 * * *"
+      "schedule": "0 8 * * 1-5"
     }
   ]
 }
